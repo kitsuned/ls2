@@ -12,8 +12,10 @@ use super::{Ack, CallMode, CancelState, Command, Tokens, encode_error};
 use crate::address::Address;
 use crate::service::{DispatchError, PeerPolicy, ReplyBody, ServicePolicy};
 use crate::stream::FeedSender;
-use crate::wire::{self, Frame, Kind, Socket};
-use crate::{Error, ErrorKind, MethodError, Request, Router, Signal, SignalFilter};
+use crate::wire::{self, Frame, Kind, Listener, Socket};
+use crate::{
+    Error, ErrorKind, MethodError, ProtocolProfile, Request, Router, Signal, SignalFilter,
+};
 
 const HUB: u32 = 0;
 const OUTBOX_CAPACITY: usize = 128;
@@ -33,6 +35,9 @@ pub(super) struct LocalService {
 
 pub(super) struct Driver {
     hub: Link,
+    listener: Option<Task<()>>,
+    profile: ProtocolProfile,
+    unique_name: String,
     peers: HashMap<u32, Peer>,
     routes: HashMap<String, u32>,
     lookups: HashMap<String, Vec<u32>>,
@@ -47,10 +52,38 @@ pub(super) struct Driver {
 }
 
 impl Driver {
-    pub(super) fn new(socket: Socket, service: Option<LocalService>, tokens: Arc<Tokens>) -> Self {
+    pub(super) fn new(
+        socket: Socket,
+        listener: Option<Listener>,
+        unique_name: String,
+        service: Option<LocalService>,
+        tokens: Arc<Tokens>,
+    ) -> Self {
         let (events, incoming) = async_channel::bounded(EVENT_CAPACITY);
+        let profile = socket.profile();
+        let listener = listener.map(|listener| {
+            let events = events.clone();
+            async_global_executor::spawn(async move {
+                loop {
+                    let event = match listener.accept().await {
+                        Ok(socket) => Event::Accepted(socket),
+                        Err(error) => {
+                            let error = Error::io("accept Luna peer", error);
+                            let _ = events.send(Event::Lost(HUB, error)).await;
+                            break;
+                        }
+                    };
+                    if events.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
         Self {
             hub: Link::start(HUB, socket, &events),
+            listener,
+            profile,
+            unique_name,
             peers: HashMap::new(),
             routes: HashMap::new(),
             lookups: HashMap::new(),
@@ -107,6 +140,7 @@ impl Driver {
             group.fail(reason.clone());
         }
         let mut tasks = vec![self.hub.task];
+        tasks.extend(self.listener);
         tasks.extend(self.peers.into_values().map(|peer| peer.link.task));
         tasks.extend(self.handlers.into_values().map(|handler| handler.task));
         for task in tasks {
@@ -180,6 +214,9 @@ impl Driver {
         let to_hub = matches!(
             address.service.as_str(),
             "com.palm.bus" | "com.webos.service.bus"
+        ) && !matches!(
+            self.profile,
+            ProtocolProfile::LocalListener | ProtocolProfile::InitiatorInfo
         );
         let frame = if to_hub {
             if address.category != "/" {
@@ -190,7 +227,13 @@ impl Driver {
             }
             wire::hub_method_call(id, &address.method, payload)
         } else {
-            wire::method_call(id, &address.category, &address.method, payload)
+            wire::method_call(
+                self.profile,
+                id,
+                &address.category,
+                &address.method,
+                payload,
+            )
         };
         let frame = match frame {
             Ok(frame) => frame,
@@ -298,6 +341,13 @@ impl Driver {
                 }
                 Ok(())
             }
+            Event::Accepted(socket) => {
+                if self.service.is_some() && self.peers.len() < MAX_PEERS {
+                    let policy = Arc::new(PeerPolicy::from_legacy_listener());
+                    self.insert_peer(socket, None, Some(policy), false)?;
+                }
+                Ok(())
+            }
             Event::Lost(HUB, error) => Err(error),
             Event::Lost(peer, error) => {
                 self.peer_lost(peer, error);
@@ -319,7 +369,7 @@ impl Driver {
 
     fn hub_frame(&mut self, frame: Frame) -> Result<(), Error> {
         match frame.kind {
-            Kind::QueryNameReply => self.offer(frame),
+            Kind::QueryNameReply | Kind::Initiator => self.offer(frame),
             Kind::Reply | Kind::ReplyWithFd | Kind::Error | Kind::ErrorUnknownMethod => {
                 self.handle_reply(HUB, &frame)
             }
@@ -334,7 +384,8 @@ impl Driver {
     }
 
     fn offer(&mut self, mut frame: Frame) -> Result<(), Error> {
-        let offer = wire::peer_offer(&frame).map_err(decode_error)?;
+        let fd = frame.fd.take();
+        let offer = wire::peer_offer(self.profile, &frame).map_err(decode_error)?;
         let name = offer.name.filter(|name| !name.is_empty());
         let waiting = if offer.code != 0 || offer.permissions & ALLOW_OUTBOUND != 0 {
             name.and_then(|name| self.lookups.remove(name))
@@ -344,8 +395,7 @@ impl Driver {
         };
         let peer = if offer.code != 0 {
             Err(lookup_error(offer.code, name))
-        } else if let Some(fd) = frame.fd.take() {
-            let offer = wire::peer_offer(&frame).map_err(decode_error)?;
+        } else if let Some(fd) = fd {
             self.add_peer(
                 offer.name,
                 offer.unique_name,
@@ -390,30 +440,59 @@ impl Driver {
                 "Luna peer offer did not contain a unique name",
             ));
         }
-        if self.peers.len() >= MAX_PEERS {
-            return Err(overloaded("too many connected Luna peers"));
-        }
-        let id = self.tokens.next()?;
-        let socket =
-            Socket::from_fd(fd).map_err(|error| Error::io("adopt Luna peer socket", error))?;
+        let socket = Socket::from_fd(fd, self.profile)
+            .map_err(|error| Error::io("adopt Luna peer socket", error))?;
         let policy = if self.service.is_some() && permissions & ALLOW_INBOUND != 0 {
             Some(Arc::new(PeerPolicy::from_hub(groups, trust, permissions)?))
         } else {
             None
         };
+        self.insert_peer(socket, name, policy, permissions & ALLOW_OUTBOUND != 0)
+    }
+
+    fn insert_peer(
+        &mut self,
+        socket: Socket,
+        name: Option<&str>,
+        policy: Option<Arc<PeerPolicy>>,
+        can_call: bool,
+    ) -> Result<u32, Error> {
+        if self.peers.len() >= MAX_PEERS {
+            return Err(overloaded("too many connected Luna peers"));
+        }
+        let id = self.tokens.next()?;
+        let link = Link::start(id, socket, &self.events);
+        if self.profile == ProtocolProfile::LocalListener && can_call {
+            let local_name = self.service.as_ref().map(|local| local.name.as_str());
+            let info = wire::client_info(self.tokens.next()?, local_name, &self.unique_name)
+                .map_err(encode_error)?;
+            link.send(info)?;
+        }
+        if self.profile.sends_client_connected() {
+            self.hub.send(Frame::new(
+                Kind::ClientConnected,
+                self.tokens.next()?,
+                false,
+                Vec::new(),
+            ))?;
+            link.send(Frame::new(
+                Kind::ClientConnected,
+                self.tokens.next()?,
+                false,
+                Vec::new(),
+            ))?;
+        }
         self.peers.insert(
             id,
             Peer {
-                link: Link::start(id, socket, &self.events),
+                link,
                 name: name.map(str::to_owned),
                 policy,
-                can_call: permissions & ALLOW_OUTBOUND != 0,
+                can_call,
             },
         );
-        if permissions & ALLOW_OUTBOUND != 0 {
-            if let Some(name) = name {
-                self.routes.insert(name.to_owned(), id);
-            }
+        if let Some(name) = name.filter(|_| can_call) {
+            self.routes.insert(name.to_owned(), id);
         }
         Ok(id)
     }
@@ -444,7 +523,7 @@ impl Driver {
                 )),
             )
         } else {
-            let (id, payload) = wire::parse_reply(frame).map_err(decode_error)?;
+            let (id, payload) = wire::parse_reply(self.profile, frame).map_err(decode_error)?;
             let response = if frame.kind == Kind::Reply {
                 Ok(payload)
             } else {
@@ -638,7 +717,7 @@ impl Driver {
     }
 
     fn dispatch(&mut self, peer: u32, frame: &Frame) -> Result<(), Error> {
-        let call = wire::parse_method_call(frame).map_err(decode_error)?;
+        let call = wire::parse_method_call(self.profile, frame).map_err(decode_error)?;
         let Some(remote) = self.peers.get(&peer) else {
             return Ok(());
         };
@@ -780,12 +859,8 @@ impl Driver {
         payload: &str,
     ) -> Result<(), Error> {
         let token = self.tokens.next()?;
-        let mut frame = if kind == Kind::Reply {
-            wire::reply(token, reply_to, payload)
-        } else {
-            wire::method_error(kind, token, reply_to, payload)
-        }
-        .map_err(encode_error)?;
+        let mut frame =
+            wire::reply(self.profile, kind, token, reply_to, payload).map_err(encode_error)?;
         frame.public = public;
         self.link(peer)?.send(frame)
     }
@@ -882,6 +957,7 @@ enum ServiceOutput {
 
 enum Event {
     Frame(u32, Frame),
+    Accepted(Socket),
     Lost(u32, Error),
     Service {
         peer: u32,

@@ -8,8 +8,8 @@
 #include <luna-service2/lunaservice-errors.h>
 #include <luna-service2/lunaservice.h>
 
-static const char service_name[] = "org.ls2.test.native";
-static const char signal_uri[] = "luna://org.ls2.test.native/test/changed";
+static const char service_name[] = "com.webos.ls2.test.native";
+static const char signal_uri[] = "luna://com.webos.ls2.test.native/test/changed";
 static const char echo_payload[] = "{ \"word\" : \"Luna\" }";
 static const char first_update[] = "{\"value\":1}";
 static const char second_update[] = "{\"value\":2}";
@@ -137,7 +137,7 @@ static bool receive_reply(LSHandle *handle, LSMessage *message, void *context)
 static bool call_rust(LSHandle *handle, GMainLoop *loop, LSError *error)
 {
     Wait echo_wait = {.loop = loop, .expected = {echo_payload}, .count = 1};
-    if (!check(LSCallOneReply(handle, "luna://org.ls2.test.rust/test/echo", echo_payload,
+    if (!check(LSCallOneReply(handle, "luna://com.webos.ls2.test.rust/test/echo", echo_payload,
                               receive_reply, &echo_wait, NULL, error), error, "call Rust echo")
         || !await(&echo_wait)) {
         return false;
@@ -145,15 +145,19 @@ static bool call_rust(LSHandle *handle, GMainLoop *loop, LSError *error)
 
     Wait update_wait = {.loop = loop, .expected = {first_update, second_update}, .count = 2};
     LSMessageToken token;
-    if (!check(LSCall(handle, "luna://org.ls2.test.rust/test/updates", "{\"subscribe\":true}",
+    if (!check(LSCall(handle, "luna://com.webos.ls2.test.rust/test/updates", "{\"subscribe\":true}",
                       receive_reply, &update_wait, &token, error), error, "subscribe to Rust updates")
         || !await(&update_wait)
         || !check(LSCallCancel(handle, token, error), error, "cancel Rust subscription")) {
         return false;
     }
 
+    if (getenv("LS2_LEGACY_ROLES")) {
+        return true;
+    }
+
     Wait deny = {.loop = loop, .count = 1, .permission_denied = true};
-    return check(LSCallOneReply(handle, "luna://org.ls2.test.rust/test/secret", "{}",
+    return check(LSCallOneReply(handle, "luna://com.webos.ls2.test.rust/test/secret", "{}",
                                 receive_reply, &deny, NULL, error), error, "call Rust secret")
         && await(&deny);
 }

@@ -1,6 +1,8 @@
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -10,23 +12,28 @@ use rustix::net::{
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketType, sockopt,
 };
 
-use super::{Frame, HEADER_LEN, Kind, MAX_BODY_LEN};
+use super::{Frame, Kind, MAX_BODY_LEN};
+use crate::ProtocolProfile;
+
+const HEADER_LEN: usize = 16;
+const SHORT_HEADER_LEN: usize = 12;
 
 /// A full-duplex LS2 byte stream. Use one receive task and one send task per socket.
 #[derive(Debug)]
 pub(crate) struct Socket {
     stream: Async<UnixStream>,
+    profile: ProtocolProfile,
 }
 
 impl Socket {
-    pub(crate) async fn connect(path: &Path) -> io::Result<Self> {
+    pub(crate) async fn connect(path: &Path, profile: ProtocolProfile) -> io::Result<Self> {
         let stream = Async::<UnixStream>::connect(path).await?;
         #[cfg(target_vendor = "apple")]
         sockopt::set_socket_nosigpipe(stream.get_ref(), true)?;
-        Ok(Self { stream })
+        Ok(Self { stream, profile })
     }
 
-    pub(crate) fn from_fd(fd: OwnedFd) -> io::Result<Self> {
+    pub(crate) fn from_fd(fd: OwnedFd, profile: ProtocolProfile) -> io::Result<Self> {
         if sockopt::socket_type(&fd)? != SocketType::STREAM
             || net::getsockname(&fd)?.address_family() != AddressFamily::UNIX
         {
@@ -37,18 +44,31 @@ impl Socket {
         sockopt::set_socket_nosigpipe(&fd, true)?;
         Ok(Self {
             stream: Async::new(UnixStream::from(fd))?,
+            profile,
         })
+    }
+
+    pub(crate) fn profile(&self) -> ProtocolProfile {
+        self.profile
+    }
+
+    fn header_len(&self) -> usize {
+        if self.profile.has_bus_flag() {
+            HEADER_LEN
+        } else {
+            SHORT_HEADER_LEN
+        }
     }
 
     pub(crate) async fn recv(&self) -> io::Result<Frame> {
         let mut header = [0; HEADER_LEN];
-        self.read_exact(&mut header).await?;
-        let (len, token, kind, public) = decode_header(header)?;
+        self.read_exact(&mut header[..self.header_len()]).await?;
+        let (len, token, kind, public) = decode_header(self.profile, header)?;
         let mut body = vec![0; len];
         self.read_exact(&mut body).await?;
 
         // The FD travels on a separate byte after the frame, even on a failed lookup.
-        let fd = if kind.has_fd_slot() {
+        let fd = if self.profile.has_descriptor(kind) {
             self.stream
                 .read_with(|stream| retry_interrupted(|| recv_descriptor(stream)))
                 .await?
@@ -66,17 +86,17 @@ impl Socket {
     }
 
     pub(crate) async fn send(&self, frame: &Frame) -> io::Result<()> {
-        let header = encode_header(frame)?;
-        if frame.fd.is_some() && !frame.kind.has_fd_slot() {
+        let header = encode_header(self.profile, frame)?;
+        if frame.fd.is_some() && !self.profile.has_descriptor(frame.kind) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "this LS2 message kind cannot carry a descriptor",
             ));
         }
 
-        self.write_all(&header).await?;
+        self.write_all(&header[..self.header_len()]).await?;
         self.write_all(&frame.body).await?;
-        if frame.kind.has_fd_slot() {
+        if self.profile.has_descriptor(frame.kind) {
             self.stream
                 .write_with(|stream| {
                     retry_interrupted(|| send_descriptor(stream, frame.fd.as_ref()))
@@ -115,7 +135,70 @@ impl Socket {
     }
 }
 
-fn encode_header(frame: &Frame) -> io::Result<[u8; HEADER_LEN]> {
+pub(crate) struct Listener {
+    #[cfg(target_os = "linux")]
+    listener: Async<UnixListener>,
+    #[cfg(target_os = "linux")]
+    profile: ProtocolProfile,
+    #[cfg(target_os = "linux")]
+    hub: net::UCred,
+}
+
+#[cfg(target_os = "linux")]
+impl Listener {
+    pub(crate) fn from_hub(fd: OwnedFd, hub: &Socket) -> io::Result<Self> {
+        if sockopt::socket_type(&fd)? != SocketType::STREAM
+            || net::getsockname(&fd)?.address_family() != AddressFamily::UNIX
+            || !sockopt::socket_acceptconn(&fd)?
+        {
+            return Err(invalid_data(
+                "LS2 registration descriptor is not a Unix listener",
+            ));
+        }
+        Ok(Self {
+            listener: Async::new(UnixListener::from(fd))?,
+            profile: hub.profile,
+            hub: sockopt::socket_peercred(hub.stream.get_ref())?,
+        })
+    }
+
+    pub(crate) async fn accept(&self) -> io::Result<Socket> {
+        loop {
+            let (stream, _) = self.listener.accept().await?;
+            // The old hub connects on behalf of an authorized caller, then transfers
+            // its end. The kernel credentials on our accepted end remain the hub's.
+            if !sockopt::socket_peercred(stream.get_ref()).is_ok_and(|peer| {
+                peer.pid == self.hub.pid && peer.uid == self.hub.uid && peer.gid == self.hub.gid
+            }) {
+                continue;
+            }
+            return Ok(Socket {
+                stream,
+                profile: self.profile,
+            });
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Listener {
+    pub(crate) fn from_hub(_fd: OwnedFd, _hub: &Socket) -> io::Result<Self> {
+        Err(Self::unsupported())
+    }
+
+    pub(crate) async fn accept(&self) -> io::Result<Socket> {
+        Err(Self::unsupported())
+    }
+
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "legacy Luna listener registration requires Linux peer credentials",
+        )
+    }
+}
+
+fn encode_header(profile: ProtocolProfile, frame: &Frame) -> io::Result<[u8; HEADER_LEN]> {
     let mut header = [0; HEADER_LEN];
     let len = u32::try_from(frame.body.len())
         .ok()
@@ -123,12 +206,17 @@ fn encode_header(frame: &Frame) -> io::Result<[u8; HEADER_LEN]> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "LS2 frame is too large"))?;
     header[0..4].copy_from_slice(&len.to_le_bytes());
     header[4..8].copy_from_slice(&frame.token.to_le_bytes());
-    header[8..12].copy_from_slice(&frame.kind.to_wire().to_le_bytes());
-    header[12] = u8::from(frame.public);
+    header[8..12].copy_from_slice(&profile.encode_kind(frame.kind)?.to_le_bytes());
+    if profile.has_bus_flag() {
+        header[12] = u8::from(frame.public);
+    }
     Ok(header)
 }
 
-fn decode_header(header: [u8; HEADER_LEN]) -> io::Result<(usize, u32, Kind, bool)> {
+fn decode_header(
+    profile: ProtocolProfile,
+    header: [u8; HEADER_LEN],
+) -> io::Result<(usize, u32, Kind, bool)> {
     let word = |offset| {
         let mut bytes = [0; 4];
         bytes.copy_from_slice(&header[offset..offset + 4]);
@@ -143,7 +231,7 @@ fn decode_header(header: [u8; HEADER_LEN]) -> io::Result<(usize, u32, Kind, bool
         1 => true,
         _ => return Err(invalid_data("invalid LS2 header bus flag")),
     };
-    Ok((len, word(4), Kind::from_wire(word(8)), public))
+    Ok((len, word(4), profile.decode_kind(word(8))?, public))
 }
 
 fn recv_descriptor(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
@@ -235,8 +323,8 @@ mod tests {
     fn pair() -> (Socket, Socket) {
         let (first, second) = UnixStream::pair().unwrap();
         (
-            Socket::from_fd(first.into()).unwrap(),
-            Socket::from_fd(second.into()).unwrap(),
+            Socket::from_fd(first.into(), ProtocolProfile::DEFAULT).unwrap(),
+            Socket::from_fd(second.into(), ProtocolProfile::DEFAULT).unwrap(),
         )
     }
 
@@ -278,7 +366,7 @@ mod tests {
                 .await
                 .unwrap();
             writer
-                .send(&Frame::new(Kind::Unknown(35), 3, false, Vec::new()))
+                .send(&Frame::new(Kind::ClientConnected, 3, false, Vec::new()))
                 .await
                 .unwrap();
 
@@ -298,8 +386,53 @@ mod tests {
             assert_eq!(failure.token, 2);
             assert!(failure.fd.is_none());
             let after = reader.recv().await.unwrap();
-            assert_eq!(after.kind, Kind::Unknown(35));
+            assert_eq!(after.kind, Kind::ClientConnected);
             assert_eq!(after.token, 3);
+        });
+    }
+
+    #[test]
+    fn legacy_node_up_does_not_consume_the_following_descriptor_frame() {
+        async_io::block_on(async {
+            for profile in [
+                ProtocolProfile::LocalListener,
+                ProtocolProfile::InitiatorInfo,
+            ] {
+                let (first, second) = UnixStream::pair().unwrap();
+                let reader = Socket::from_fd(first.into(), profile).unwrap();
+                let writer = Socket::from_fd(second.into(), profile).unwrap();
+                let (offered, _peer) = UnixStream::pair().unwrap();
+                let mut offer = Frame::new(Kind::QueryNameReply, 2, false, vec![1, 2, 3]);
+                offer.fd = Some(offered.into());
+
+                // Type 3 means NodeUp in both legacy numberings. Later TVs use
+                // that number for an FD-bearing reply.
+                writer.write_all(&[0, 0, 0, 0, 1]).await.unwrap();
+                let mut rest = vec![0, 0, 0, 3, 0, 0, 0];
+                if profile.has_bus_flag() {
+                    rest.extend_from_slice(&[0; 4]);
+                }
+                writer.write_all(&rest).await.unwrap();
+                writer.send(&offer).await.unwrap();
+                writer
+                    .send(&Frame::new(Kind::Signal, 3, false, vec![4]))
+                    .await
+                    .unwrap();
+
+                let next_frame = || {
+                    future::race(reader.recv(), async {
+                        async_io::Timer::after(std::time::Duration::from_secs(1)).await;
+                        Err(io::ErrorKind::TimedOut.into())
+                    })
+                };
+                let ready = next_frame().await.unwrap();
+                assert_eq!(ready.kind, Kind::NodeUp);
+                assert!(ready.fd.is_none());
+                let offered = next_frame().await.unwrap();
+                assert_eq!(offered.kind, Kind::QueryNameReply);
+                assert!(offered.fd.is_some());
+                assert_eq!(next_frame().await.unwrap().body, [4]);
+            }
         });
     }
 

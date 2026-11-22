@@ -34,6 +34,10 @@ async fn system_time() -> Result<String, ls2::Error> {
 
 Clone `Connection` to share the same bus registration across tasks. Use `Connection::builder()` to set a custom timeout or hub socket path. Service payloads pass through as sent, so check fields such as `returnValue` according to the service’s contract.
 
+## Firmware compatibility
+
+`ls2` selects a wire profile from the installed LS2 ELF files before connecting. It checks the installed library’s transport symbols, file descriptor message numbers, and reply layout. Profiles are named for wire features and can span multiple firmware releases. Use `Connection::builder().protocol_profile(...)` to select a supported layout explicitly. A custom socket defaults to `ProtocolProfile::LengthPrefixedReplies` and accepts the same override.
+
 ## JSON with Serde
 
 Enable the `serde` feature to serialize requests and deserialize replies, updates, and signals. The example uses `serde_json::Value`. Your own types can implement `Serialize` for requests and `Deserialize` for replies.

@@ -92,51 +92,51 @@ Type=static
 EOF
 }
 
-write_service tv_smoke org.ls2.test.rust org.ls2.test.native
-write_service native-fixture org.ls2.test.native org.ls2.test.rust
+write_service tv_smoke com.webos.ls2.test.rust com.webos.ls2.test.native
+write_service native-fixture com.webos.ls2.test.native com.webos.ls2.test.rust
 
 cat > "$policy/api.json" <<'EOF'
 {
-  "org.ls2.test.calls": [
-    "org.ls2.test.rust/test/echo",
-    "org.ls2.test.native/test/echo",
-    "org.ls2.test.rust/test/updates",
-    "org.ls2.test.native/test/updates",
-    "org.ls2.test.rust/com/palm/luna/private/cancel",
-    "org.ls2.test.native/com/palm/luna/private/cancel",
+  "com.webos.ls2.test.calls": [
+    "com.webos.ls2.test.rust/test/echo",
+    "com.webos.ls2.test.native/test/echo",
+    "com.webos.ls2.test.rust/test/updates",
+    "com.webos.ls2.test.native/test/updates",
+    "com.webos.ls2.test.rust/com/palm/luna/private/cancel",
+    "com.webos.ls2.test.native/com/palm/luna/private/cancel",
     "com.webos.service.bus/signal/publish/test/changed",
     "com.webos.service.bus/signal/subscribe/test/changed"
   ],
-  "org.ls2.test.secret": ["org.ls2.test.rust/test/secret", "org.ls2.test.native/test/secret"]
+  "com.webos.ls2.test.secret": ["com.webos.ls2.test.rust/test/secret", "com.webos.ls2.test.native/test/secret"]
 }
 EOF
 
 cat > "$policy/client.json" <<'EOF'
 {
-  "org.ls2.test.rust": ["org.ls2.test.calls"],
-  "org.ls2.test.native": ["org.ls2.test.calls"]
+  "com.webos.ls2.test.rust": ["com.webos.ls2.test.calls"],
+  "com.webos.ls2.test.native": ["com.webos.ls2.test.calls"]
 }
 EOF
 
 cat > "$policy/groups.json" <<'EOF'
 {
-  "allowedNames": ["org.ls2.test.rust", "org.ls2.test.native"],
-  "org.ls2.test.calls": ["dev"],
-  "org.ls2.test.secret": ["dev"]
+  "allowedNames": ["com.webos.ls2.test.rust", "com.webos.ls2.test.native"],
+  "com.webos.ls2.test.calls": ["dev"],
+  "com.webos.ls2.test.secret": ["dev"]
 }
 EOF
 
 cat > "$policy/allowed.json" <<'EOF'
-{"dev": ["org.ls2.test.calls", "org.ls2.test.secret"]}
+{"dev": ["com.webos.ls2.test.calls", "com.webos.ls2.test.secret"]}
 EOF
 printf '{}\n' > "$policy/forced.json"
 
-cat > "$policy/manifests/org.ls2.test.json" <<EOF
+cat > "$policy/manifests/com.webos.ls2.test.json" <<EOF
 {
-  "id": "org.ls2.test",
+  "id": "com.webos.ls2.test",
   "version": "1.0.0",
-  "roleFiles": ["$policy/org.ls2.test.rust.role.json", "$policy/org.ls2.test.native.role.json"],
-  "serviceFiles": ["$policy/org.ls2.test.rust.service", "$policy/org.ls2.test.native.service"],
+  "roleFiles": ["$policy/com.webos.ls2.test.rust.role.json", "$policy/com.webos.ls2.test.native.role.json"],
+  "serviceFiles": ["$policy/com.webos.ls2.test.rust.service", "$policy/com.webos.ls2.test.native.service"],
   "apiPermissionFiles": ["$policy/api.json"],
   "clientPermissionFiles": ["$policy/client.json"],
   "groupsFiles": ["$policy/groups.json"]
@@ -195,9 +195,10 @@ wait_for() {
 
 start() {
     fixture=$1
-    mode=$2
-    fixture_log=$stage/$fixture-$mode.log
-    timeout -k 2 30 "$stage/$fixture" "$mode" > "$fixture_log" 2>&1 &
+    action=$2
+    fixture_log=$stage/$fixture-$action.log
+    : > "$fixture_log"
+    timeout -k 2 30 "$stage/$fixture" "$action" > "$fixture_log" 2>&1 &
     fixture_pid=$!
     wait_for "$fixture_pid" grep -q '^READY$' "$fixture_log"
 }

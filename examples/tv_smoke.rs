@@ -6,12 +6,12 @@ use std::io;
 use std::time::Duration;
 
 use futures_lite::{StreamExt, stream};
-use ls2::{Connection, ConnectionBuilder, ErrorKind, Reply, Router, SignalFilter};
+use ls2::{Connection, ConnectionBuilder, ErrorKind, ProtocolProfile, Reply, Router, SignalFilter};
 
-const RUST_NAME: &str = "org.ls2.test.rust";
-const NATIVE_ECHO: &str = "luna://org.ls2.test.native/test/echo";
-const NATIVE_UPDATES: &str = "luna://org.ls2.test.native/test/updates";
-const NATIVE_SECRET: &str = "luna://org.ls2.test.native/test/secret";
+const RUST_NAME: &str = "com.webos.ls2.test.rust";
+const NATIVE_ECHO: &str = "luna://com.webos.ls2.test.native/test/echo";
+const NATIVE_UPDATES: &str = "luna://com.webos.ls2.test.native/test/updates";
+const NATIVE_SECRET: &str = "luna://com.webos.ls2.test.native/test/secret";
 const ECHO: &str = r#"{ "word" : "Luna" }"#;
 const FIRST: &str = r#"{"value":1}"#;
 const SECOND: &str = r#"{"value":2}"#;
@@ -27,9 +27,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
         "active" => active().await?,
         "serve" => serve().await?,
         "client" => client().await?,
-        "watch" => watch().await?,
+        "register" => {
+            let bus = builder().connect().await?;
+            println!("PROFILE {:?}", bus.protocol_profile());
+            bus.close().await;
+        }
+        "watch" => watch(false).await?,
+        "disconnect" => watch(true).await?,
         "emit" => emit().await?,
-        _ => return Err(io::Error::other("usage: tv_smoke active|serve|client|watch|emit").into()),
+        _ => {
+            return Err(io::Error::other(
+                "usage: tv_smoke active|serve|client|register|watch|emit|disconnect",
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -122,6 +133,10 @@ async fn client() -> Result<(), Box<dyn Error>> {
         )?;
     }
     updates.cancel().await?;
+    if bus.protocol_profile() == ProtocolProfile::LocalListener {
+        bus.close().await;
+        return Ok(());
+    }
     match bus.call_raw(NATIVE_SECRET, "{}").await {
         Err(error) if error.kind() == ErrorKind::PermissionDenied => {}
         result => {
@@ -135,12 +150,18 @@ async fn client() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn watch() -> Result<(), Box<dyn Error>> {
+async fn watch(disconnect: bool) -> Result<(), Box<dyn Error>> {
     let bus = builder().register(RUST_NAME, Router::new()).await?;
     let mut signals = bus
         .watch_signal(SignalFilter::exact("/test", "changed")?)
         .await?;
     println!("READY");
+    if disconnect {
+        return check(
+            matches!(signals.next().await, Some(Err(error)) if error.kind() == ErrorKind::Disconnected),
+            "hub disconnect did not terminate the Rust signal stream",
+        ).map_err(Into::into);
+    }
     let received = signals
         .next()
         .await

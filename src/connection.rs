@@ -20,10 +20,11 @@ use futures_lite::future;
 use crate::address::{self, Address};
 use crate::service::ServicePolicy;
 use crate::stream::{self, Feed, FeedSender};
-use crate::wire::{self, Kind, Socket};
-use crate::{Error, ErrorKind, Router, Signal, SignalFilter, SignalStream, Subscription};
+use crate::wire::{self, Frame, Kind, Listener, Socket};
+use crate::{
+    Error, ErrorKind, ProtocolProfile, Router, Signal, SignalFilter, SignalStream, Subscription,
+};
 
-const DEFAULT_SOCKET: &str = "/var/run/luna-service2/com.palm.hub";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_CAPACITY: usize = 128;
 pub(crate) const STREAM_CAPACITY: usize = 32;
@@ -48,24 +49,34 @@ impl fmt::Debug for Connection {
 /// Options for connecting a client or registering a named service.
 #[derive(Clone, Debug)]
 pub struct ConnectionBuilder {
-    socket_path: PathBuf,
+    socket_path: Option<PathBuf>,
+    profile: Option<ProtocolProfile>,
     timeout: Duration,
 }
 
 impl Default for ConnectionBuilder {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from(DEFAULT_SOCKET),
+            socket_path: None,
+            profile: None,
             timeout: DEFAULT_TIMEOUT,
         }
     }
 }
 
 impl ConnectionBuilder {
-    /// Uses the specified hub socket in place of the webOS TV default.
+    /// Uses a custom hub socket and the [`ProtocolProfile::LengthPrefixedReplies`] profile by default.
+    /// Select a different profile with [`Self::protocol_profile`].
     #[must_use]
     pub fn socket_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.socket_path = path.as_ref().to_owned();
+        self.socket_path = Some(path.as_ref().to_owned());
+        self
+    }
+
+    /// Uses a specific firmware protocol instead of inspecting the installed LS2 binaries.
+    #[must_use]
+    pub fn protocol_profile(mut self, profile: ProtocolProfile) -> Self {
+        self.profile = Some(profile);
         self
     }
 
@@ -80,7 +91,8 @@ impl ConnectionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket is unavailable or the hub refuses registration.
+    /// Returns an error if the firmware profile is unknown, the socket is unavailable,
+    /// or the hub refuses registration.
     pub async fn connect(self) -> Result<Connection, Error> {
         self.open(None).await
     }
@@ -104,18 +116,29 @@ impl ConnectionBuilder {
         }
         let timeout = self.timeout;
         within(timeout, "connect to Luna hub", async move {
-            let socket = Socket::connect(&self.socket_path)
+            let profile = match self.profile {
+                Some(profile) => profile,
+                None if self.socket_path.is_some() => ProtocolProfile::DEFAULT,
+                None => async_global_executor::spawn_blocking(ProtocolProfile::detect).await?,
+            };
+            let path = self
+                .socket_path
+                .as_deref()
+                .unwrap_or_else(|| profile.hub_path());
+            let socket = Socket::connect(path, profile)
                 .await
                 .map_err(|error| Error::io("connect to Luna hub socket", error))?;
             let service_name = service.as_ref().map(|(name, _)| *name);
             let tokens = Arc::new(Tokens::default());
-            let request = wire::request_name(tokens.next()?, service_name).map_err(encode_error)?;
+            let request =
+                wire::request_name(profile, tokens.next()?, service_name).map_err(encode_error)?;
             write_setup(&socket, &request).await?;
-            let reply = read_setup(&socket).await?;
+            let mut reply = read_setup(&socket).await?;
             if reply.kind != Kind::RequestNameReply {
                 return Err(Error::protocol("expected a Luna registration reply"));
             }
-            let registration = wire::registration(&reply)
+            let listener_fd = reply.fd.take();
+            let registration = wire::registration(profile, &reply)
                 .map_err(|error| Error::io("decode Luna registration", error))?
                 .map_err(registration_error)?;
             let monitor = read_setup(&socket).await?;
@@ -132,6 +155,31 @@ impl ConnectionBuilder {
                     ErrorKind::PermissionDenied,
                     "the Luna hub denied private bus registration",
                 ));
+            }
+            let listener = if profile == ProtocolProfile::LocalListener {
+                let fd = listener_fd.ok_or_else(|| {
+                    Error::protocol("legacy Luna registration did not provide a listener")
+                })?;
+                Some(
+                    Listener::from_hub(fd, &socket)
+                        .map_err(|error| Error::io("adopt Luna listener", error))?,
+                )
+            } else {
+                None
+            };
+            let unique_name = registration.unique_name.to_owned();
+            if profile.sends_node_up() {
+                if profile == ProtocolProfile::LocalListener {
+                    let ready = Frame::new(Kind::NodeUp, tokens.next()?, false, Vec::new());
+                    write_setup(&socket, &ready).await?;
+                }
+                let info = wire::client_info(tokens.next()?, service_name, &unique_name)
+                    .map_err(encode_error)?;
+                write_setup(&socket, &info).await?;
+                if profile != ProtocolProfile::LocalListener {
+                    let ready = Frame::new(Kind::NodeUp, tokens.next()?, false, Vec::new());
+                    write_setup(&socket, &ready).await?;
+                }
             }
             let local = service
                 .map(|(name, router)| {
@@ -150,7 +198,7 @@ impl ConnectionBuilder {
             let name = local.as_ref().map(|service| service.name.as_str());
             if let Some(service) = &local {
                 for (category, methods) in service.router.categories() {
-                    let frame = wire::append_category(tokens.next()?, category, methods)
+                    let frame = wire::append_category(profile, tokens.next()?, category, methods)
                         .map_err(encode_error)?;
                     write_setup(&socket, &frame).await?;
                 }
@@ -169,9 +217,10 @@ impl ConnectionBuilder {
                 tokens: Arc::clone(&tokens),
                 service_name: name.map(str::to_owned),
                 timeout,
+                profile,
             });
             async_global_executor::spawn(async move {
-                let driver = driver::Driver::new(socket, local, tokens);
+                let driver = driver::Driver::new(socket, listener, unique_name, local, tokens);
                 driver.run(requests, cancelled, terminal).await;
                 finished.close();
             })
@@ -183,7 +232,7 @@ impl ConnectionBuilder {
 }
 
 impl Connection {
-    /// Returns a builder initialized with the webOS TV socket and a ten-second timeout.
+    /// Returns a builder that detects the TV protocol and uses a ten-second timeout.
     #[must_use]
     pub fn builder() -> ConnectionBuilder {
         ConnectionBuilder::default()
@@ -196,6 +245,12 @@ impl Connection {
     /// Returns an error if the socket is unavailable or the hub refuses registration.
     pub async fn connect() -> Result<Self, Error> {
         Self::builder().connect().await
+    }
+
+    /// Returns the firmware protocol selected for this connection.
+    #[must_use]
+    pub fn protocol_profile(&self) -> ProtocolProfile {
+        self.inner.profile
     }
 
     /// Returns the registered service name for a named connection.
@@ -436,6 +491,7 @@ struct Inner {
     tokens: Arc<Tokens>,
     service_name: Option<String>,
     timeout: Duration,
+    profile: ProtocolProfile,
 }
 
 impl Inner {

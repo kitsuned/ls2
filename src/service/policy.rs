@@ -21,6 +21,7 @@ pub(crate) struct ServicePolicy {
 #[derive(Debug)]
 pub(crate) struct PeerPolicy {
     inbound: bool,
+    authorized_by_listener: bool,
     groups: BTreeSet<String>,
     trust: Option<String>,
 }
@@ -48,6 +49,9 @@ impl ServicePolicy {
         method: &str,
         public: bool,
     ) -> bool {
+        if peer.authorized_by_listener {
+            return !public;
+        }
         if !peer.inbound || (self.legacy && (public || !self.legacy_private)) {
             return false;
         }
@@ -97,6 +101,15 @@ impl ServicePolicy {
 }
 
 impl PeerPolicy {
+    pub(crate) fn from_legacy_listener() -> Self {
+        Self {
+            inbound: true,
+            authorized_by_listener: true,
+            groups: BTreeSet::new(),
+            trust: None,
+        }
+    }
+
     pub(crate) fn from_hub(
         groups: Option<&str>,
         trust: Option<&str>,
@@ -105,6 +118,7 @@ impl PeerPolicy {
         let groups = parse_array(groups, "peer groups")?;
         Ok(Self {
             inbound: permissions & ALLOW_INBOUND != 0,
+            authorized_by_listener: false,
             groups: labels(&groups, "peer groups")?.into_iter().collect(),
             trust: parse_trust(trust)?,
         })

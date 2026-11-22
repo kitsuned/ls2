@@ -33,8 +33,11 @@ impl TestHub {
 
     async fn accept_client(&self) -> Socket {
         let (stream, _) = self.listener.accept().await.expect("accept Luna client");
-        let socket = Socket::from_fd(stream.into_inner().expect("extract stream").into())
-            .expect("adopt test socket");
+        let socket = Socket::from_fd(
+            stream.into_inner().expect("extract stream").into(),
+            crate::ProtocolProfile::DEFAULT,
+        )
+        .expect("adopt test socket");
         let request = read(&socket).await;
         assert_eq!(request.kind, Kind::RequestName);
         let mut body = Vec::new();
@@ -90,7 +93,11 @@ async fn offer_peer(hub: &Socket) -> Socket {
     let mut offer = Frame::new(Kind::QueryNameReply, 3, false, body);
     offer.fd = Some(client.into());
     write(hub, &offer).await;
-    Socket::from_fd(remote.into()).expect("adopt test peer socket")
+    let peer = Socket::from_fd(remote.into(), crate::ProtocolProfile::DEFAULT)
+        .expect("adopt test peer socket");
+    assert_eq!(read(hub).await.kind, Kind::ClientConnected);
+    assert_eq!(read(&peer).await.kind, Kind::ClientConnected);
+    peer
 }
 
 fn argument_int(body: &mut Vec<u8>, value: i32) {
@@ -114,7 +121,14 @@ fn argument_string(body: &mut Vec<u8>, value: Option<&str>) {
 async fn send_reply(peer: &Socket, serial: u32, call: u32, payload: &str) {
     write(
         peer,
-        &wire::reply(serial, call, payload).expect("encode test reply"),
+        &wire::reply(
+            crate::ProtocolProfile::DEFAULT,
+            Kind::Reply,
+            serial,
+            call,
+            payload,
+        )
+        .expect("encode test reply"),
     )
     .await;
 }
@@ -155,7 +169,7 @@ async fn concurrent_calls_route_replies_by_token_and_cancel_one_shots() {
             let first = read(&peer).await;
             let second = read(&peer).await;
             for call in [&second, &first] {
-                let payload = wire::parse_method_call(call)
+                let payload = wire::parse_method_call(crate::ProtocolProfile::DEFAULT, call)
                     .expect("decode test call")
                     .payload;
                 send_reply(&peer, 30, call.token, payload).await;
@@ -298,7 +312,8 @@ async fn serde_round_trip_and_decode_errors() {
                 let frame = read(&peer).await;
                 if frame.kind == Kind::MethodCall {
                     calls += 1;
-                    let method = wire::parse_method_call(&frame).expect("decode typed request");
+                    let method = wire::parse_method_call(crate::ProtocolProfile::DEFAULT, &frame)
+                        .expect("decode typed request");
                     let result = if calls == 1 {
                         method.payload
                     } else {

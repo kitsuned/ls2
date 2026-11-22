@@ -18,11 +18,13 @@
 mod address;
 mod connection;
 mod error;
+mod profile;
 mod service;
 mod stream;
 mod wire;
 
 pub use connection::{Connection, ConnectionBuilder};
 pub use error::{Error, ErrorKind};
+pub use profile::ProtocolProfile;
 pub use service::{MethodError, Reply, Request, Router};
 pub use stream::{Signal, SignalFilter, SignalStream, Subscription};

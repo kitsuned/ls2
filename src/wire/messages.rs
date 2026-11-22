@@ -2,6 +2,7 @@ use std::io;
 use std::str;
 
 use super::{Frame, Kind, MAX_BODY_LEN};
+use crate::{ProtocolProfile, profile::ReplyLayout};
 
 const PROTOCOL_VERSION: i32 = 1;
 const ARG_END: u32 = 0;
@@ -17,6 +18,7 @@ const CANCEL_CATEGORY: &str = "/com/palm/luna/private";
 const CANCEL_METHOD: &str = "cancel";
 
 pub(crate) struct Registration<'a> {
+    pub(crate) unique_name: &'a str,
     pub(crate) provided_groups: Option<&'a str>,
     pub(crate) provided_trust: Option<&'a str>,
     pub(crate) flags: i32,
@@ -43,15 +45,24 @@ pub(crate) struct SignalMessage<'a> {
     pub(crate) payload: &'a str,
 }
 
-pub(crate) fn request_name(token: u32, name: Option<&str>) -> io::Result<Frame> {
+pub(crate) fn request_name(
+    profile: ProtocolProfile,
+    token: u32,
+    name: Option<&str>,
+) -> io::Result<Frame> {
     let mut args = Arguments::default();
     args.i32(PROTOCOL_VERSION)?;
     args.string(name)?;
-    args.string(None)?;
+    if profile != ProtocolProfile::LocalListener {
+        args.string(None)?;
+    }
     args.frame(Kind::RequestName, token)
 }
 
-pub(crate) fn registration(frame: &Frame) -> io::Result<Result<Registration<'_>, i32>> {
+pub(crate) fn registration(
+    profile: ProtocolProfile,
+    frame: &Frame,
+) -> io::Result<Result<Registration<'_>, i32>> {
     if frame.kind != Kind::RequestNameReply {
         return Err(invalid_data("expected a Luna registration reply"));
     }
@@ -62,16 +73,36 @@ pub(crate) fn registration(frame: &Frame) -> io::Result<Result<Registration<'_>,
     }
 
     args.i32()?; // Privileged flag.
-    args.i32()?; // Proxy flag.
-    if args.string()?.is_none_or(str::is_empty) {
-        return Err(invalid_data("registration reply is missing a unique name"));
+    if !profile.sends_node_up() {
+        args.i32()?; // Proxy flag.
     }
-
-    let provided_groups = args.string()?;
-    let flags = args.i32()?;
-    let provided_trust = args.string()?;
-    args.string()?; // Our trust level.
+    let unique_name = args
+        .string()?
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid_data("registration reply is missing a unique name"))?;
+    let (provided_groups, provided_trust, flags) = if profile == ProtocolProfile::LocalListener {
+        (None, None, 0)
+    } else {
+        let groups = args.string()?;
+        match profile {
+            ProtocolProfile::TrustBeforeFlags => {
+                let trust = args.string()?;
+                args.string()?; // Required trust rules for outgoing calls.
+                args.string()?; // Local trust label.
+                (groups, trust, args.i32()?)
+            }
+            ProtocolProfile::LengthPrefixedReplies => {
+                let flags = args.i32()?;
+                let trust = args.string()?;
+                args.string()?; // Local trust label.
+                (groups, trust, flags)
+            }
+            _ => (groups, None, args.i32()?),
+        }
+    };
+    args.finish_registration()?;
     Ok(Ok(Registration {
+        unique_name,
         provided_groups,
         provided_trust,
         flags,
@@ -85,20 +116,52 @@ pub(crate) fn query_name(token: u32, name: &str) -> io::Result<Frame> {
     args.frame(Kind::QueryName, token)
 }
 
-pub(crate) fn peer_offer(frame: &Frame) -> io::Result<PeerOffer<'_>> {
+pub(crate) fn client_info(token: u32, name: Option<&str>, unique: &str) -> io::Result<Frame> {
+    let mut args = Arguments::default();
+    args.string(name)?;
+    args.string(Some(unique))?;
+    args.frame(Kind::ClientInfo, token)
+}
+
+pub(crate) fn peer_offer(profile: ProtocolProfile, frame: &Frame) -> io::Result<PeerOffer<'_>> {
     let mut args = ArgReader::new(&frame.body);
+    if frame.kind == Kind::Initiator {
+        let name = args.string()?;
+        let unique_name = args.string()?;
+        args.string()?; // Application ID.
+        return Ok(PeerOffer {
+            code: 0,
+            name,
+            unique_name,
+            permissions: 1, // This connected descriptor is for incoming calls.
+            groups: args.string()?,
+            trust: None,
+        });
+    }
     let code = args.i32()?;
     let name = args.string()?;
     let unique_name = args.string()?;
     args.i32()?; // Whether the hub launched the service on demand.
-    let (groups, permissions, trust) = if code == 0 {
+    let (groups, permissions, trust) = if code != 0 {
+        (None, 0, None)
+    } else if matches!(
+        profile,
+        ProtocolProfile::LocalListener | ProtocolProfile::InitiatorInfo
+    ) {
+        (None, 2, None) // The query reply opens an outgoing route.
+    } else {
         args.string()?; // The peer's application ID.
         let groups = args.string()?;
         let permissions = args.i32()?;
-        (groups, permissions, args.string()?)
-    } else {
-        // A failed query ends after the dynamic flag with native allocation padding.
-        (None, 0, None)
+        let trust = if matches!(
+            profile,
+            ProtocolProfile::TrustBeforeFlags | ProtocolProfile::LengthPrefixedReplies
+        ) {
+            args.string()?
+        } else {
+            None
+        };
+        (groups, permissions, trust)
     };
     Ok(PeerOffer {
         code,
@@ -111,13 +174,16 @@ pub(crate) fn peer_offer(frame: &Frame) -> io::Result<PeerOffer<'_>> {
 }
 
 pub(crate) fn append_category<'a>(
+    profile: ProtocolProfile,
     token: u32,
     category: &str,
     methods: impl IntoIterator<Item = &'a str>,
 ) -> io::Result<Frame> {
     let mut args = Arguments::default();
     args.string(Some(category))?;
-    args.i32(0)?; // Category flags for regular method registration.
+    if !profile.sends_node_up() {
+        args.i32(0)?; // Category flags for regular method registration.
+    }
     for method in methods {
         args.string(Some(method))?;
     }
@@ -132,26 +198,39 @@ pub(crate) fn hub_method_call(token: u32, method: &str, payload: &str) -> io::Re
 }
 
 pub(crate) fn method_call(
+    profile: ProtocolProfile,
     token: u32,
     category: &str,
     method: &str,
     payload: &str,
 ) -> io::Result<Frame> {
-    string_frame(
-        Kind::MethodCall,
-        token,
-        &[category, method, payload, "", ""],
-    )
+    let fields = [category, method, payload, "", ""];
+    let count = if profile == ProtocolProfile::LengthPrefixedReplies {
+        5
+    } else {
+        4
+    };
+    string_frame(Kind::MethodCall, token, &fields[..count])
 }
 
-pub(crate) fn parse_method_call(frame: &Frame) -> io::Result<MethodCall<'_>> {
+pub(crate) fn parse_method_call(
+    profile: ProtocolProfile,
+    frame: &Frame,
+) -> io::Result<MethodCall<'_>> {
     let mut bytes = frame.body.as_slice();
     let category = read_cstr(&mut bytes)?;
     let method = read_cstr(&mut bytes)?;
     let payload = read_cstr(&mut bytes)?;
     // The per-call application ID is self-reported. Only trust the hub offer's metadata.
     read_cstr(&mut bytes)?;
-    read_cstr(&mut bytes)?;
+    if matches!(
+        profile,
+        ProtocolProfile::IntentResolution | ProtocolProfile::LengthPrefixedReplies
+    ) && !bytes.is_empty()
+    {
+        // Native calls can include an additional caller field depending on the API used.
+        read_cstr(&mut bytes)?;
+    }
     end_of_body(bytes)?;
     Ok(MethodCall {
         category,
@@ -160,29 +239,26 @@ pub(crate) fn parse_method_call(frame: &Frame) -> io::Result<MethodCall<'_>> {
     })
 }
 
-pub(crate) fn reply(token: u32, reply_to: u32, payload: &str) -> io::Result<Frame> {
-    reply_frame(Kind::Reply, token, reply_to, payload)
-}
-
-pub(crate) fn method_error(
+pub(crate) fn reply(
+    profile: ProtocolProfile,
     kind: Kind,
     token: u32,
     reply_to: u32,
     payload: &str,
 ) -> io::Result<Frame> {
-    reply_frame(kind, token, reply_to, payload)
-}
-
-fn reply_frame(kind: Kind, token: u32, reply_to: u32, payload: &str) -> io::Result<Frame> {
     validate_reply_payload(payload)?;
     let payload_len = payload.len() + 1;
-    let size = wire_len(payload_len)?;
     let mut body = Vec::with_capacity(REPLY_PREFIX_LEN + payload_len);
     body.extend_from_slice(&reply_to.to_le_bytes());
-    body.extend_from_slice(JSON_PAYLOAD_TYPE.as_bytes());
-    body.push(0);
-    body.extend_from_slice(&size.to_le_bytes());
-    body.extend_from_slice(&REPLY_PADDING);
+    let layout = profile.reply_layout();
+    if layout != ReplyLayout::Plain {
+        body.extend_from_slice(JSON_PAYLOAD_TYPE.as_bytes());
+        body.push(0);
+    }
+    if layout == ReplyLayout::Sized {
+        body.extend_from_slice(&wire_len(payload_len)?.to_le_bytes());
+        body.extend_from_slice(&REPLY_PADDING);
+    }
     body.extend_from_slice(payload.as_bytes());
     body.push(0);
     Ok(Frame::new(kind, token, false, body))
@@ -197,16 +273,19 @@ pub(crate) fn reply_token(frame: &Frame) -> io::Result<u32> {
     read_u32(&mut frame.body.as_slice())
 }
 
-pub(crate) fn parse_reply(frame: &Frame) -> io::Result<(u32, &str)> {
+pub(crate) fn parse_reply(profile: ProtocolProfile, frame: &Frame) -> io::Result<(u32, &str)> {
     let mut bytes = frame.body.as_slice();
     let reply_to = read_u32(&mut bytes)?;
-    if read_cstr(&mut bytes)? != JSON_PAYLOAD_TYPE {
+    let layout = profile.reply_layout();
+    if layout != ReplyLayout::Plain && read_cstr(&mut bytes)? != JSON_PAYLOAD_TYPE {
         return Err(invalid_data("unsupported reply payload type"));
     }
-    let size = read_u32(&mut bytes)? as usize;
-    take_array::<{ REPLY_PADDING.len() }>(&mut bytes)?;
-    if bytes.len() != size {
-        return Err(invalid_data("invalid reply payload length"));
+    if layout == ReplyLayout::Sized {
+        let size = read_u32(&mut bytes)? as usize;
+        take_array::<{ REPLY_PADDING.len() }>(&mut bytes)?;
+        if bytes.len() != size {
+            return Err(invalid_data("invalid reply payload length"));
+        }
     }
     let payload = read_cstr(&mut bytes)?;
     end_of_body(bytes)?;
@@ -360,6 +439,17 @@ impl<'a> ArgReader<'a> {
         end_of_body(bytes)?;
         Ok(Some(string))
     }
+
+    fn finish_registration(self) -> io::Result<()> {
+        // A longer reply can introduce trust restrictions that an older layout
+        // would otherwise silently skip.
+        if self.0 != [0; ARG_HEADER_LEN] {
+            return Err(invalid_data(
+                "registration arguments do not match the selected Luna profile",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn take_array<const N: usize>(bytes: &mut &[u8]) -> io::Result<[u8; N]> {
@@ -433,7 +523,7 @@ mod tests {
 
     #[test]
     fn request_name_uses_native_alignment_and_null_strings() {
-        let request = request_name(7, Some("a.b")).unwrap();
+        let request = request_name(ProtocolProfile::DEFAULT, 7, Some("a.b")).unwrap();
         let expected = [
             2, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, // Protocol version.
             1, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, b'a', b'.', b'b', 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -451,7 +541,7 @@ mod tests {
         args.string(None).unwrap();
         args.i32(0).unwrap();
         let frame = Frame::new(Kind::QueryNameReply, 4, false, args.0);
-        let offer = peer_offer(&frame).unwrap();
+        let offer = peer_offer(ProtocolProfile::DEFAULT, &frame).unwrap();
         assert_eq!(offer.code, -4);
         assert_eq!(offer.name, Some("com.example.missing"));
         assert_eq!(offer.unique_name, None);
@@ -463,7 +553,7 @@ mod tests {
         for value in [0, 0, 0] {
             args.i32(value).unwrap();
         }
-        args.string(Some("tFX0oVEt")).unwrap();
+        args.string(Some("test-client")).unwrap();
         args.string(Some(r#"[{"category":"/test/echo","groups":["echo"]}]"#))
             .unwrap();
         args.i32(0).unwrap();
@@ -471,7 +561,9 @@ mod tests {
             .unwrap();
         args.string(Some("public")).unwrap();
         let frame = args.frame(Kind::RequestNameReply, 1).unwrap();
-        let accepted = registration(&frame).unwrap().unwrap();
+        let accepted = registration(ProtocolProfile::DEFAULT, &frame)
+            .unwrap()
+            .unwrap();
         assert_eq!(accepted.flags, 0);
         assert_eq!(
             accepted.provided_groups,
@@ -481,25 +573,48 @@ mod tests {
             accepted.provided_trust,
             Some(r#"[{"group":"echo","trust":[""]}]"#),
         );
+        assert!(registration(ProtocolProfile::IntentResolution, &frame).is_err());
+    }
+
+    #[test]
+    fn registration_can_place_trust_before_flags() {
+        let provided = r#"[{"group":"example","provided":["dev"]}]"#;
+        let mut args = Arguments::default();
+        args.i32(0).unwrap();
+        args.i32(0).unwrap();
+        args.string(Some("test-client")).unwrap();
+        args.string(Some("[]")).unwrap();
+        args.string(Some(provided)).unwrap();
+        args.string(Some("[]")).unwrap();
+        args.string(Some("dev")).unwrap();
+        args.i32(2).unwrap();
+        let frame = args.frame(Kind::RequestNameReply, 1).unwrap();
+
+        let registration = registration(ProtocolProfile::TrustBeforeFlags, &frame)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registration.unique_name, "test-client");
+        assert_eq!(registration.provided_trust, Some(provided));
+        assert_eq!(registration.flags, 2);
     }
 
     #[test]
     fn tv_peer_offer_decodes_trust_before_auxiliary_metadata() {
         let mut args = Arguments::default();
         args.i32(0).unwrap();
-        args.string(Some("com.palm.systemservice")).unwrap();
-        args.string(Some("5pLb2jEk")).unwrap();
+        args.string(Some("com.example.clock")).unwrap();
+        args.string(Some("test-peer")).unwrap();
         args.i32(0).unwrap();
         args.string(None).unwrap();
-        args.string(Some(r#"["time.query"]"#)).unwrap();
+        args.string(Some(r#"["time.read"]"#)).unwrap();
         args.i32(2).unwrap();
         args.string(Some("platform")).unwrap();
         args.string(None).unwrap();
         args.string(Some("[]")).unwrap();
         let frame = args.frame(Kind::QueryNameReply, 1).unwrap();
-        let offer = peer_offer(&frame).unwrap();
+        let offer = peer_offer(ProtocolProfile::DEFAULT, &frame).unwrap();
         assert_eq!(offer.permissions, 2);
-        assert_eq!(offer.groups, Some(r#"["time.query"]"#));
+        assert_eq!(offer.groups, Some(r#"["time.read"]"#));
         assert_eq!(offer.trust, Some("platform"));
     }
 
@@ -518,26 +633,38 @@ mod tests {
     #[test]
     fn raw_payload_preserves_whitespace_and_unicode() {
         let payload = " {\"message\": \"Grüße\"} \n";
-        let call = method_call(1, "/", "test", payload).unwrap();
-        assert_eq!(parse_method_call(&call).unwrap().payload, payload);
-        let reply = reply(2, 1, payload).unwrap();
-        assert_eq!(parse_reply(&reply).unwrap(), (1, payload));
+        let call = method_call(ProtocolProfile::DEFAULT, 1, "/", "test", payload).unwrap();
+        assert_eq!(
+            parse_method_call(ProtocolProfile::DEFAULT, &call)
+                .unwrap()
+                .payload,
+            payload
+        );
+        let reply = reply(ProtocolProfile::DEFAULT, Kind::Reply, 2, 1, payload).unwrap();
+        assert_eq!(
+            parse_reply(ProtocolProfile::DEFAULT, &reply).unwrap(),
+            (1, payload)
+        );
     }
 
     #[test]
     fn tv_reply_contains_explicit_payload_length_and_alignment() {
         let payload = r#"{"returnValue":true}"#;
         let body = b"\x02\0\0\0json\0\x15\0\0\0\0\0\0{\"returnValue\":true}\0";
-        let frame = reply(5, 2, payload).unwrap();
+        let frame = reply(ProtocolProfile::DEFAULT, Kind::Reply, 5, 2, payload).unwrap();
         assert_eq!(&frame.body, body);
-        assert_eq!(parse_reply(&frame).unwrap(), (2, payload));
+        assert_eq!(
+            parse_reply(ProtocolProfile::DEFAULT, &frame).unwrap(),
+            (2, payload)
+        );
     }
 
     #[test]
     fn tv_method_call_has_two_fields_after_the_payload() {
-        let frame = method_call(2, "/time", "getSystemTime", "{}").unwrap();
+        let frame =
+            method_call(ProtocolProfile::DEFAULT, 2, "/time", "getSystemTime", "{}").unwrap();
         assert_eq!(&frame.body, b"/time\0getSystemTime\0{}\0\0\0");
-        let call = parse_method_call(&frame).unwrap();
+        let call = parse_method_call(ProtocolProfile::DEFAULT, &frame).unwrap();
         assert_eq!(call.category, "/time");
         assert_eq!(call.method, "getSystemTime");
         assert_eq!(call.payload, "{}");
@@ -545,8 +672,17 @@ mod tests {
 
     #[test]
     fn tv_append_category_has_flags_and_no_end_marker() {
-        let frame = append_category(2, "/test", ["echo", "updates", "secret"]).unwrap();
-        assert_eq!(frame.kind.to_wire(), 28);
+        let frame = append_category(
+            ProtocolProfile::DEFAULT,
+            2,
+            "/test",
+            ["echo", "updates", "secret"],
+        )
+        .unwrap();
+        assert_eq!(
+            ProtocolProfile::DEFAULT.encode_kind(frame.kind).unwrap(),
+            28
+        );
         assert_eq!(frame.body.len(), 92);
         let mut args = ArgReader::new(&frame.body);
         assert_eq!(args.string().unwrap(), Some("/test"));
@@ -560,7 +696,9 @@ mod tests {
     #[test]
     fn embedded_nul_is_rejected() {
         assert_eq!(
-            method_call(1, "/", "test", "{}\0{}").unwrap_err().kind(),
+            method_call(ProtocolProfile::DEFAULT, 1, "/", "test", "{}\0{}")
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput,
         );
     }

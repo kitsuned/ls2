@@ -1,1 +1,4 @@
 /target/
+/firmware
+/research/
+/.DS_Store
